@@ -670,8 +670,15 @@ jobs:
           echo "已建立 kernel-cache（$(du -sh kernel-cache | cut -f1)）"
 
       # ────────────────────────────────────────────── 9. 构建系统镜像
+      # rootfs 构建器**固定在已验证的 commit**（17a922a，2026-11-19 HEAD）：
+      # 后面的「修补 build.sh」步骤会往 build.sh 里打补丁，上游一漂移
+      # hunk 上下文就会错位（前两次 run 正是这样挂掉的）。仓库很小，全量克隆无所谓。
       - name: 克隆 rootfs 构建器
-        run: git clone --depth 1 "$ROOTFS_REPO" rootfs-builder
+        run: |
+          set -euxo pipefail
+          git clone "$ROOTFS_REPO" rootfs-builder
+          git -C rootfs-builder checkout --detach 17a922a73e6cd040925ada00e3acfdce92f699e2
+          git -C rootfs-builder log --oneline -1
 
       # 这一步是**整个流程能不能在 180 分钟里跑完的关键**：实测这台 runner
       # 编一次内核要 77 分钟。如果不复用，workflow 编一遍 + build.sh 再编一遍
@@ -1050,138 +1057,81 @@ jobs:
           cd rootfs-builder
           cat > /tmp/0002-kernel-cache.patch <<'PATCH_EOF'
           diff --git a/build.sh b/build.sh
-          index d85a804..70c5425 100755
+          index 674e96a..33caa9c 100755
           --- a/build.sh
           +++ b/build.sh
-          @@ -141,8 +141,59 @@ KBOUT="$WORK/kernel"
-           STUB="rootfs-$DEVICE$NAME_SUFFIX-$TS"
+          @@ -219,6 +219,24 @@ STUB="rootfs-$DEVICE-$DISTRO_NAME$NAME_SUFFIX$UI_SUFFIX-$TS"
            BASE="$STUB.img"
            IMGF="$OUT/$BASE"
-          +
+           mkdir -p "$ROOTFS" "$KBOUT" "$OUT"
           +# ---------------------------------------------------------------- kernel cache
           +# Compiling the kernel and its ~1500 modules takes 10-15 minutes and does not
-          +# depend on anything that changes while iterating on the userspace steps
-          +# (mmdebstrap mirror, package list, overlay, ...).  Rebuilding it on every run
-          +# wastes that time and, because the kernel build is the first thing to fail,
-          +# it also hides later problems behind it.
+          +# depend on anything that changes while iterating on the userspace steps.
+          +# When KERNEL_CACHE (implicit default: $OUT/kernel-cache) already contains a
+          +# finished build (Image + .config + Module.symvers + .ko files), that tree is
+          +# copied into the work area and steps 0-2 are skipped entirely.
           +#
-          +# When KERNEL_CACHE is set to a directory that already contains a finished
-          +# build (an `out/`-style tree: arch/arm64/boot/Image + .config + Module.symvers
-          +# + the .ko files), that tree is copied into the work area and steps 0-2 are
-          +# skipped entirely.  Populate it with:  KERNEL_CACHE=/path ./build.sh ...
-          +# on a successful run, or by copying a previous work directory.
-          +# The cache path is IMPLICIT on purpose: $OUT/kernel-cache.
-          +#
-          +# Relying on an exported KERNEL_CACHE does not work here because build.sh runs
-          +# under sudo, and Ubuntu's sudoers has env_reset set, which drops arbitrary
-          +# environment variables even when `sudo -E` is used.  Looking in a fixed place
-          +# removes that failure mode entirely.
-          +#
-          +# KERNEL_CACHE can still be set explicitly to point somewhere else.
+          +# KERNEL_CACHE is looked up implicitly on purpose: build.sh runs under sudo
+          +# and Ubuntu's sudoers env_reset drops arbitrary environment variables even
+          +# with `sudo -E`.  It can still be set explicitly to point somewhere else.
           +KERNEL_CACHE="${KERNEL_CACHE:-$OUT/kernel-cache}"
           +CACHE_HIT=0
-          +if [ -f "$KERNEL_CACHE/arch/arm64/boot/Image" ] \
-          +   && [ -f "$KERNEL_CACHE/.config" ] && [ -f "$KERNEL_CACHE/Module.symvers" ]; then
+          +if [ "$ROOTFS_ONLY" = 0 ] \
+          +	&& [ -f "$KERNEL_CACHE/arch/arm64/boot/Image" ] \
+          +	&& [ -f "$KERNEL_CACHE/.config" ] && [ -f "$KERNEL_CACHE/Module.symvers" ]; then
           +	CACHE_HIT=1
           +fi
           +echo "kernel cache: $KERNEL_CACHE (hit=$CACHE_HIT)"
-          +if [ "$CACHE_HIT" = "1" ]; then
-          +	# The module directory name has to match what the flashed kernel reports,
-          +	# or none of the modules load.  The cache records it in
-          +	# include/config/kernel.release; refuse a cache whose release disagrees
-          +	# with the Makefile version we are about to report.
-          +	cached_rel="$(cat "$KERNEL_CACHE/include/config/kernel.release" 2>/dev/null || true)"
-          +	if [ -z "$cached_rel" ]; then
-          +		echo "  warning: cache has no include/config/kernel.release; not using it"
-          +		CACHE_HIT=0
-          +	fi
-          +	echo "  cached kernel release: ${cached_rel:-<unknown>}"
-          +	echo "  cached Image:          $(stat -c%s "$KERNEL_CACHE/arch/arm64/boot/Image") bytes"
-          +	echo "  cached modules:        $(find "$KERNEL_CACHE" -name '*.ko' | wc -l) .ko"
-          +fi
-          +
-           rm -rf "$WORK"
-           mkdir -p "$ROOTFS" "$KBOUT" "$OUT"
-          +if [ "$CACHE_HIT" = "1" ]; then
-          +	log "0. reusing the cached kernel build from $KERNEL_CACHE"
-          +	cp -a "$KERNEL_CACHE/." "$KBOUT/"
-          +	# the exported source tree is still needed for `modules_install` and for
-          +	# the version info below
-          +	git -C "$KERNEL_REPO" archive --format=tar "$KERNEL_REF" \
-          +		| tar -x -C "$KBOUT" --keep-old-files 2>/dev/null || true
-          +fi
            # The script runs as root, but later CI steps (build info) write into --out as
            # the invoking user, so hand the directory over when sudo tells us who that is.
            if [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
-          @@ -231,7 +282,46 @@ if [ -n "${KERNEL_LOCALVERSION:-}" ]; then
-           fi
+          @@ -229,6 +247,19 @@ fi
+           KVER=none
+           CONFIG_SOURCE=none
+           if [ "$ROOTFS_ONLY" = 0 ]; then
+          +if [ "$CACHE_HIT" = "1" ]; then
+          +	# The module directory name has to match what the flashed kernel reports,
+          +	# or none of the modules load.  The cache records it in
+          +	# include/config/kernel.release; refuse a cache whose release is missing.
+          +	log "0. reusing the cached kernel build from $KERNEL_CACHE"
+          +	cp -a "$KERNEL_CACHE/." "$KBOUT/"
+          +	cd "$KBOUT"
+          +	KVER="$(cat "$KBOUT/include/config/kernel.release" 2>/dev/null || true)"
+          +	[ -n "$KVER" ] || die "cache is missing include/config/kernel.release"
+          +	echo "kernel release (module directory): $KVER"
+          +	echo "  Image:   $(stat -c%s "$KBOUT/arch/arm64/boot/Image") bytes"
+          +	echo "  modules: $(find "$KBOUT" -name '*.ko' | wc -l) .ko files"
+          +else
+           log "0. kernel '$KERNEL_REF' from $KERNEL_REPO"
+           KERNEL_COMMIT="$(kernel_git rev-parse "$KERNEL_REF^{commit}")"
+           KVER_MAKEFILE="$(kernel_git show "$KERNEL_REF:Makefile" 2>/dev/null \
+          @@ -338,6 +369,13 @@ fi
            echo "kernel release (module directory): $KVER"
            
-          +# ---------------------------------------------------------------- cache fast path
-          +# When KERNEL_CACHE supplied a finished build, steps 2/2b are pure waste: the
-          +# Image, .config, Module.symvers and every .ko are already in $KBOUT.  Skip
-          +# straight to the userspace work, which is what actually needs iterating on.
-          +if [ "$CACHE_HIT" = "1" ]; then
-          +	log "2. kernel image: SKIPPED (cache hit)"
-          +	KIMAGE="$KBOUT/arch/arm64/boot/Image"
-          +	[ -f "$KIMAGE" ] || die "cache is missing arch/arm64/boot/Image"
-          +	echo "  Image:   $(stat -c%s "$KIMAGE") bytes"
-          +	echo "  modules: $(find "$KBOUT" -name '*.ko' | wc -l) .ko files"
-          +	# KVER must match the cache; the module dir name decides whether they load
-          +	KVER="$(cat "$KBOUT/include/config/kernel.release" 2>/dev/null || echo "$KVER_MAKEFILE")"
-          +	echo "  kernel release from cache: $KVER"
-          +else
            log "2. build the kernel image"
-          +# ---------------------------------------------------------------- dtbs FIRST
-          +# `make dtbs` MUST run before `make vmlinux` on these branches.
-          +#
-          +# CONFIG_XIAOMI_RUBENS makes arch/arm64/kernel/Makefile depend on the board DTB
-          +# so it can objcopy it into rubens-dtb.o (setup.c then installs it as
-          +# initial_boot_params, overriding LK's FDT).  The rule that is supposed to
-          +# generate that DTB is broken:
-          +#
-          +#   $(srctree)/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb: FORCE
-          +#       $(Q)$(MAKE) -C $(srctree) ARCH=arm64 LLVM=1 mediatek/mt6895-xiaomi-rubens.dtb
-          +#
-          +# It passes no O=$(objtree), so the sub-make runs in the SOURCE tree, finds no
-          +# .config and dies with:
-          +#   *** Configuration file ".config" not found!
-          +#   make[6]: *** [Makefile:892: .config] Error 1
-          +#   make[5]: *** [.../arch/arm64/kernel/Makefile:86: ...rubens.dtb] Error 2
-          +# Because the rule is marked FORCE it fires on every build, so the failure
-          +# always lands on vmlinux -- and only on vmlinux, which is why a plain
-          +# `make dtbs` looks like it works.
-          +#
-          +# Building dtbs first leaves the file on disk, so the broken rule becomes a
-          +# no-op for the rest of the build.
+          +# Build the board DTB before the Image: with CONFIG_XIAOMI_RUBENS the
+          +# embedded-DTB object in arch/arm64/kernel needs the .dtb on disk, and its
+          +# FORCE rule cannot generate it itself (it runs the sub-make without O= and
+          +# dies on a missing .config).  With the file present the broken rule becomes
+          +# a no-op.  Harmless for devices that don't embed a DTB.
           +# shellcheck disable=SC2086
-          +make -j"$JOBS" $KERNEL_MAKE_ARGS dtbs
-          +
+          +make -j"$JOBS" $KERNEL_MAKE_ARGS "mediatek/${DTS%.dts}.dtb" || true
            # `make modules` on its own cannot work in a fresh tree: modpost has no
            # vmlinux.symvers yet and reports every core symbol as undefined.  Building
            # vmlinux first produces it (and gives us the Image the modules belong to,
-          @@ -240,18 +330,23 @@ log "2. build the kernel image"
-           make -j"$JOBS" $KERNEL_MAKE_ARGS vmlinux
-           KIMAGE="$KBOUT/arch/arm64/boot/Image"
-           [ -f "$KIMAGE" ] || echo "warning: no Image at $KIMAGE"
-          -# best effort: some branches embed the DTB in the Image instead (pearl does)
-          -# shellcheck disable=SC2086
-          -make -j"$JOBS" $KERNEL_MAKE_ARGS dtbs >/dev/null 2>&1 || true
-           
+          @@ -352,10 +390,17 @@ make -j"$JOBS" $KERNEL_MAKE_ARGS "mediatek/${DTS%.dts}.dtb"
            log "2b. build modules"
            # shellcheck disable=SC2086
            make -j"$JOBS" $KERNEL_MAKE_ARGS modules
-          +fi   # end of cache fast path / kernel build
+          +fi   # end of kernel cache fast path
+           fi
            
            # ---------------------------------------------------------------- userspace
            log "3. bootstrap $DISTRO_NAME/$SUITE ($ARCH)"
-           # shellcheck source=/dev/null
-           . "$HERE/distros/$DISTRO_NAME.sh"
-          +# Export the mirror and arch so both distro_bootstrap (called with them as
-          +# arguments) and distro_configure (which reads $MIRROR / $ARCH from the
-          +# environment, see distros/ubuntu.sh) resolve to the SAME archive.  Without
-          +# this, a backend that defaults its mirror can end up writing a sources.list
-          +# that points somewhere other than the one the bootstrap used.
+          +# Export the mirror and arch so distro_configure (which reads $MIRROR / $ARCH
+          +# from the environment, see distros/ubuntu.sh) resolves to the same archive
+          +# distro_bootstrap used; without this a backend that defaults its mirror can
+          +# end up writing a sources.list that points somewhere else.
           +export MIRROR ARCH
           +MIRROR="${MIRROR:-${UBUNTU_PORTS_MIRROR:-}}"
            distro_bootstrap "$ROOTFS" "$SUITE" "$ARCH" "$MIRROR" "$JOBS"
