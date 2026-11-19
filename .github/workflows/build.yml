@@ -100,6 +100,13 @@ jobs:
       options: --user root --privileged
     timeout-minutes: 180
 
+    # 容器里 run 步骤的默认 shell 不保证是 bash（实测 shopt 等内建命令
+    # 会 exit 127）。workflow 里不少步骤依赖 bash 语法（local、${!v} 等），
+    # 所以在 job 级别显式固定 bash，别靠默认值。
+    defaults:
+      run:
+        shell: bash
+
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
@@ -458,6 +465,7 @@ jobs:
       - name: 应用移植补丁
         if: env.SKIP_KERNEL_BUILD != '1'
         id: patch
+        shell: bash
         run: |
           set -euxo pipefail
           cd kernel
@@ -466,13 +474,26 @@ jobs:
           git config --global user.email ci@localhost
           # 应用 patches/ 下所有补丁（按文件名排序，0001/0002/... 依次生效）。
           # 改内核源码不需要 fork：新增一个 0002-xxx.patch 即可。
-          shopt -s nullglob
-          PATCHES=(../patches/*.patch)
-          shopt -u nullglob
-          [ ${#PATCHES[@]} -gt 0 ] || { echo "::error::patches/ 下没有任何 .patch 文件"; exit 1; }
-          for p in "${PATCHES[@]}"; do
+          # 注意：刻意只用 POSIX 结构（set -- / "$@"），不用数组和 shopt ——
+          # 这里的 step 默认 shell 不一定是 bash，bash 专属语法会 exit 127。
+          set -- ../patches/*.patch
+          if [ ! -e "$1" ]; then
+            echo "::error::patches/ 下没有任何 .patch 文件"
+            exit 1
+          fi
+          for p in "$@"; do
             echo ">>> 应用 $(basename "$p")"
-            git am --3way "$p"
+            git am --3way "$p" || {
+              {
+                echo "### git am 失败：$(basename "$p")"
+                echo ""
+                echo '```'
+                git am --show-current-patch=diff 2>&1 | head -80 || true
+                git status --short || true
+                echo '```'
+              } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+              exit 1
+            }
           done
           # 工作区必须干净：否则 setlocalversion 会给内核版本追加 '+'，
           # 导致 uname -r 变成 7.2.0+ 而 /lib/modules/7.2.0 里的模块全部失配
@@ -481,7 +502,7 @@ jobs:
             echo "::error::工作区不干净，内核版本号会带 + 后缀"
             exit 1
           }
-          git log --oneline -2
+          git log --oneline -3
 
       # ────────────────────────────────────────────── 5b. 补丁失败时的指引
       # 换用别的内核 commit 时，补丁可能对不上。这里把冲突细节打出来，
