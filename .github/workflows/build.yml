@@ -880,6 +880,16 @@ jobs:
           # 设备 blob 由 --firmware 提供。
           UBUNTU_COMPONENTS="${UBUNTU_COMPONENTS:-main,universe}"
 
+          # ---- build.sh（17a922a 起）的后端契约 ------------------------------
+          # build.sh source 本文件后会立即校验：DISTRO_HOST_TOOLS 必须设置
+          # （其中的工具都会被逐一 command -v 检查），SUITE 兜底取
+          # DISTRO_DEFAULT_SUITE；rootfs 校验阶段还会读 INIT_SYSTEM。
+          DISTRO_HOST_TOOLS="mmdebstrap chroot unshare systemctl curl"
+          DISTRO_DEFAULT_SUITE=resolute
+          INIT_SYSTEM=systemd
+          ADMIN_GROUP=sudo
+          SSH_UNIT=ssh.service
+
           # 默认镜像：清华 TUNA，含完整 Ubuntu ports arm64 归档。
           # 可用 --mirror 或 UBUNTU_PORTS_MIRROR 覆盖。
           # 备选：mirrors.ustc.edu.cn / mirrors.aliyun.com / mirrors.huaweicloud.com
@@ -889,6 +899,66 @@ jobs:
           # 与 Debian 后端共用，所以只在 Ubuntu 上叫法不同的包列在这里并合并。
           UBUNTU_PACKAGES_CORE="systemd systemd-sysv systemd-resolved \
                                 openssh-server sudo kmod locales tzdata"
+
+          # ---- 新契约要求的三个函数 ------------------------------------------
+          # distro_chroot：带独立挂载命名空间的 chroot（来自上游 common.sh），
+          # build.sh 用它装 root 密码、编 VA-API 驱动等。
+          distro_chroot() {
+          	local root="$1"; shift
+          	unshare --mount --propagation private bash -euc '
+          		root=$1; shift
+          		mount --bind "$root" "$root"
+          		mkdir -p "$root/dev" "$root/proc" "$root/run"
+          		mount -t tmpfs -o mode=0755 tmpfs "$root/dev"
+          		for node in null zero random urandom; do
+          			touch "$root/dev/$node"
+          			mount --bind "/dev/$node" "$root/dev/$node"
+          		done
+          		mkdir -p "$root/dev/pts" "$root/dev/shm"
+          		mount -t devpts devpts "$root/dev/pts"
+          		ln -s pts/ptmx "$root/dev/ptmx"
+          		ln -s /proc/self/fd "$root/dev/fd"
+          		ln -s fd/0 "$root/dev/stdin"
+          		ln -s fd/1 "$root/dev/stdout"
+          		ln -s fd/2 "$root/dev/stderr"
+          		mount -t proc proc "$root/proc"
+          		mount -t tmpfs tmpfs "$root/run"
+          		chroot "$root" /usr/bin/env DEBIAN_FRONTEND=noninteractive \
+          			PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "$@"
+          	' bash "$root" "$@"
+          }
+
+          # distro_install_packages：逐包安装，缺包容忍（这是本项目后端与
+          # 上游最大的差异——Ubuntu ports 上的设备包列表经常有缺口）。
+          distro_install_packages() {
+          	local root="$1"; shift
+          	distro_chroot "$root" /bin/sh -c 'apt-get update -qq' || \
+          		echo "warning: apt-get update failed" >&2
+          	local p
+          	for p in $*; do
+          		if distro_chroot "$root" /bin/sh -c \
+          			"DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $p" \
+          			>/dev/null 2>&1; then
+          			echo "  installed: $p"
+          		else
+          			echo "  SKIPPED (not installable): $p" >&2
+          		fi
+          	done
+          }
+
+          # distro_finalize：收尾清理（改自上游 common.sh，全部加兜底）。
+          distro_finalize() {
+          	local root="$1"
+          	# 首次启动扩展根文件系统；单元可能不在 overlay 里，容忍缺失。
+          	systemctl --root="$root" enable mt6895-firstboot.service >/dev/null 2>&1 || true
+          	systemctl --root="$root" mask systemd-firstboot.service >/dev/null 2>&1 || true
+          	rm -f "$root/etc/resolv.conf" "$root"/etc/ssh/ssh_host_* \
+          	      "$root/var/lib/dbus/machine-id" 2>/dev/null || true
+          	ln -s /run/NetworkManager/resolv.conf "$root/etc/resolv.conf"
+          	: > "$root/etc/machine-id"
+          	find "$root/var/cache" -type f -delete 2>/dev/null || true
+          	[ ! -d "$root/var/lib/apt/lists" ] || find "$root/var/lib/apt/lists" -type f -delete
+          }
 
           distro_bootstrap() {
           	local rootfs="$1" suite="$2" arch="$3" mirror="$4" jobs="$5"
@@ -1317,9 +1387,10 @@ jobs:
       #
       # 「在新开的一次 action 里直接跳过内核编译」靠这一步。缓存键含内核来源、
       # 内核配置与补丁的指纹，所以它们一变就会自动重建，不会用错缓存。
-      # 放在流程最末尾：只有前面的构建都成功了才值得把产物存起来。
+      # 内核编译一次约 45 分钟，无论后续 userspace 步骤成败都值得保存——
+      # 否则 rootfs 阶段的任何失败都要重付一次完整内核编译。
       - name: 保存内核缓存
-        if: env.SKIP_KERNEL_BUILD != '1'
+        if: always() && env.SKIP_KERNEL_BUILD != '1'
         uses: actions/cache/save@v4
         with:
           path: kernel-cache
