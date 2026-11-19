@@ -1,0 +1,86 @@
+From f350e8b2bca9b1fa3a6062aa0b8d6b1fdfc1dc36 Mon Sep 17 00:00:00 2001
+From: panyunlong <panyunlong@tb>
+Date: Thu, 19 Nov 2026 10:10:00 +0800
+Subject: [PATCH] connectivity: fix firmware retry race and cap NVRAM retry
+ window
+
+- conninfra: platform_request_firmware() only retried -EAGAIN and gave
+  up immediately on -ENOENT, so conninfra.cfg loaded during early init
+  (before rootfs) was permanently lost; retry every error for up to ~3s
+  (bounded, initramfs copy normally succeeds on the first request)
+- wlan_drv_gen4m: XAGA_NVRAM_MAX_RETRIES 480 -> 120; the nvram blob is
+  copied from nvdata by the initramfs /init so 30s is still a wide
+  margin, and the boot is far past userspace by then anyway
+
+See build repo docs/PITFALLS.md section 8.
+---
+ .../conninfra/conf/conninfra_conf.c           | 30 ++++++++++++++-----
+ .../wlan_drv_gen4m/os/linux/gl_init.c         |  9 +++++-
+ 2 files changed, 31 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/misc/mediatek/connectivity/conninfra/conf/conninfra_conf.c b/drivers/misc/mediatek/connectivity/conninfra/conf/conninfra_conf.c
+index 7766415..2604d09 100755
+--- a/drivers/misc/mediatek/connectivity/conninfra/conf/conninfra_conf.c
++++ b/drivers/misc/mediatek/connectivity/conninfra/conf/conninfra_conf.c
+@@ -525,15 +525,31 @@ static int platform_request_firmware(char *patch_name, osal_firmware **ppPatch)
+ 	}
+ 
+ 	*ppPatch = NULL;
+-	do {
+-		ret = request_firmware((const struct firmware **)&fw,
+-							patch_name, NULL);
+-		if (ret == -EAGAIN) {
+-			pr_err("failed to open or read!(%s), retry again!\n",
+-						patch_name);
++	/*
++	 * This runs from conninfra_conf_init() during early boot (~1.4s),
++	 * before the rootfs is mounted, so the file can legitimately be
++	 * missing for a while.  The original loop only retried -EAGAIN and
++	 * bailed out immediately on -ENOENT, permanently losing the config
++	 * (cfg_exist stuck at 0, "Get conf fail" spam on every power-on).
++	 * Retry every error for up to ~3s instead: the file normally lives
++	 * in the initramfs, so the first request succeeds at no cost, and
++	 * the bounded window keeps a missing file from stalling boot.
++	 */
++	{
++		int tries;
++
++		for (tries = 0; tries < 30; tries++) {
++			ret = request_firmware(
++				(const struct firmware **)&fw, patch_name,
++				NULL);
++			if (ret == 0)
++				break;
++			pr_err_ratelimited(
++				"failed to open or read!(%s), retry %d/30\n",
++				patch_name, tries + 1);
+ 			osal_sleep_ms(100);
+ 		}
+-	} while (ret == -EAGAIN);
++	}
+ 	if (ret != 0) {
+ 		pr_err("failed to open or read!(%s)\n", patch_name);
+ 		release_firmware(fw);
+diff --git a/drivers/misc/mediatek/connectivity/wlan_drv_gen4m/os/linux/gl_init.c b/drivers/misc/mediatek/connectivity/wlan_drv_gen4m/os/linux/gl_init.c
+index 8272590..56b5879 100644
+--- a/drivers/misc/mediatek/connectivity/wlan_drv_gen4m/os/linux/gl_init.c
++++ b/drivers/misc/mediatek/connectivity/wlan_drv_gen4m/os/linux/gl_init.c
+@@ -2523,7 +2523,14 @@ extern int mtk_wcn_wlan_func_ctrl(enum xaga_wlan_opid opId);
+ static struct delayed_work wlan_nvram_defer_work;
+ static struct device *wlan_nvram_dev;
+ #define XAGA_NVRAM_RETRY_MS 250
+-#define XAGA_NVRAM_MAX_RETRIES 480 /* ~120s */
++/*
++ * The nvram blob is copied out of the nvdata partition by the initramfs
++ * /init, so its appearance time varies between boots.  120 retries (~30s)
++ * keeps a wide margin for slow boots while cutting the worst-case retry
++ * log spam to a quarter of the original 480 (~120s): a boot that still
++ * has no nvram after 30s has bigger problems than this retry helping.
++ */
++#define XAGA_NVRAM_MAX_RETRIES 120 /* ~30s */
+ #define XAGA_PWRON_RETRY_MS 3000
+ #define XAGA_PWRON_MAX_RETRIES 3
+ 
+-- 
+2.55.0.windows.3
+

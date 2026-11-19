@@ -27,13 +27,14 @@
 | 10 | `configs/rubens-ubuntu-overlay.config` | 2.0 KB | **本地原创**（相对上游的差分） | `scripts/extract-overlay.sh` |
 | 11 | `configs/mt6895-fixups.config` | 1.2 KB | **本地原创** | 手写 |
 | 12 | `patches/0001-rubens-port-fixes.patch` | 29 KB | **本地原创**（5 个文件，来源各异） | 见 [§3](#3-patches) |
-| 13 | `ramdisk-proven.lz4` | 729 KB | **本机构建产物** | 见 [§4](#4-ramdisk-provenlz4) |
-| 14 | `firmware/`（15 个文件） | 3.2 MB | **上游 initramfs 仓库 + 本设备 vendor 分区** | 见 §5 |
-| 15 | `scripts/verify-kernel.sh` | 6.0 KB | **本地原创** | 手写 |
-| 16 | `scripts/make-bootimg.sh` | 16 KB | **本地原创** | 手写 |
-| 17 | `scripts/flash.sh` | 6.4 KB | **本地原创** | 手写（只打印，不执行） |
-| 18 | `scripts/extract-overlay.sh` | 2.8 KB | **本地原创** | 手写 |
-| 19 | `scripts/ci-summary.sh` | 3.3 KB | **本地原创** | 手写 |
+| 13 | `patches/0002-connectivity-fix-firmware-retry-race-and-cap-NVRAM-r.patch` | 3.6 KB | **本地原创**（2 个文件） | 见 [§3](#3-patches) |
+| 14 | `ramdisk-proven.lz4` | 729 KB | **本机构建产物** | 见 [§4](#4-ramdisk-provenlz4) |
+| 15 | `firmware/`（15 个文件） | 3.2 MB | **上游 initramfs 仓库 + 本设备 vendor 分区** | 见 §5 |
+| 16 | `scripts/verify-kernel.sh` | 6.0 KB | **本地原创** | 手写 |
+| 17 | `scripts/make-bootimg.sh` | 16 KB | **本地原创** | 手写 |
+| 18 | `scripts/flash.sh` | 6.4 KB | **本地原创** | 手写（只打印，不执行） |
+| 19 | `scripts/extract-overlay.sh` | 2.8 KB | **本地原创** | 手写 |
+| 20 | `scripts/ci-summary.sh` | 3.3 KB | **本地原创** | 手写 |
 
 **没有任何一个文件是从厂商 ROM 里直接搬来的。** 唯一来自设备的是
 `firmware/` 里的两个触摸屏文件（`st_fts_L11a.ftb`、`stm_fts_production_limits.csv`），
@@ -104,6 +105,19 @@ U1 的 arch/arm64/configs/defconfig          （上游基线）
 ---
 
 ## 3. `patches/`
+
+### `0002-connectivity-fix-firmware-retry-race-and-cap-NVRAM-r.patch`（3.6 KB）
+
+`git format-patch` 的产物（2026-11-19 生成，基线 `80d38270aa`，应用顺序在
+`0001` 之后）。修的是 PITFALLS §8 的两个遗留点，2 个文件：
+
+| 文件 | 改动 | 内容 |
+|---|---|---|
+| `drivers/misc/mediatek/connectivity/conninfra/conf/conninfra_conf.c` | 重写重试循环 | `platform_request_firmware()` 原来只对 `-EAGAIN` 重试、`-ENOENT` 直接放弃（§8 问题 A 的根因）；改为任何错误都重试、上限 30 次 × 100ms ≈ 3s。initramfs 里有 `conninfra.cfg` 时首次请求即成功，零成本；initramfs 缺文件时最多阻塞 3s，不会拖死启动 |
+| `drivers/misc/mediatek/connectivity/wlan_drv_gen4m/os/linux/gl_init.c` | 改一个常量 + 注释 | `XAGA_NVRAM_MAX_RETRIES` 480（~120s）→ 120（~30s）。NVRAM blob 由 initramfs `/init` 从 nvdata 分区拷出，出现时机不定，30s 仍是宽裕余量；刷屏上限降到原来的 1/4（§8 方向 3，取保守值而非文档原建议的 20） |
+
+生成方式：对 `80d38270aa` 稀疏检出 connectivity 子树，本地修改后
+`git format-patch`，已在原树上 `git am` 验证可干净应用。
 
 ### `0001-rubens-port-fixes.patch`（29 KB）
 

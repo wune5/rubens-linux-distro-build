@@ -644,12 +644,40 @@ POWER_SUPPLY_VOLTAGE_NOW=4454000        ← 4.45 V，非常健康
 
 **当前的实用结论**：插 USB 启动是可行的日常用法（设备功能完全正常）。
 
-**若要继续深挖，建议方向**：
+**若要继续深挖，建议方向（2026-11-19 已评估并部分落地）**：
 
-1. 把 connectivity 驱动改成模块（`CONFIG_MTK_COMBO=m` / `CONFIG_CFG80211=m` / `CONFIG_BT=m`），
-   让它们等 rootfs 挂载后 probe —— **一次性消除所有固件时序问题**
+1. ~~把 connectivity 驱动改成模块（`CONFIG_MTK_COMBO=m` / `CONFIG_CFG80211=m` / `CONFIG_BT=m`）~~
+   **评估结论：在本内核树不可行，放弃。** 核实 `drivers/misc/mediatek/connectivity/Kconfig`
+   （基线 `80d38270aa`）：`MTK_COMBO` / `MTK_COMBO_WIFI` / `MTK_COMBO_BT` 全部是
+   **`bool`，不是 tristate**——Kconfig 层面根本不提供 `=m` 选项。要模块化得先重写
+   Kconfig + Makefile 并审计整棵下游驱动（自有 osal 层、早期 init 钩子、全局状态），
+   是大工程且风险高。还有两个连锁陷阱：
+   - `MTK_COMBO_BT` 是 `bool` 且 `depends on BT`，`CONFIG_BT=m` 时它会**直接消失**，蓝牙被砍；
+   - wlan_drv_gen4m 是内建驱动且依赖 `CFG80211`，`CONFIG_CFG80211=m` 会让内建驱动的配置非法。
+   更重要的是：模块化想解决"等 rootfs 挂载后再 probe"，而这个能力 wlan 驱动**已经有了**——
+   `wlan_nvram_deferred_poweron()` 用 delayed work 每 250ms 重试直到 NVRAM 出现，
+   天然不依赖 probe 时机。所以方向 1 的核心收益已被现有设计覆盖。
 2. 检查 USB 插入到底改变了什么（`mt6375-chg` 的 VBUS 检测 → conninfra 上电路径？）
-3. 降低 `XAGA_NVRAM_MAX_RETRIES`（480 → 20）至少让刷屏在 5 秒内停止
+   —— **仍需真机实验**，无法离线定位。
+3. ~~降低 `XAGA_NVRAM_MAX_RETRIES`（480 → 20）~~ **已落地，但取 120 而非 20**：
+   NVRAM blob 由 initramfs `/init` 从 nvdata 分区拷出，出现时机不定，20 次（5s）太激进
+   ——若拷贝/挂载晚于 5s，WiFi 会"after 20 retries"永久放弃。120 次（30s）保住余量，
+   刷屏上限降到 1/4。见 `patches/0002-*.patch`。
+
+**2026-11-19 新增 `patches/0002-connectivity-fix-firmware-retry-race-and-cap-NVRAM-r.patch`**：
+
+- **conninfra**：`platform_request_firmware()` 原来只对 `-EAGAIN` 重试、`-ENOENT`
+  直接放弃——这是问题 A 的根因（initramfs 里的 `conninfra.cfg` 只是绕过，不是修复）。
+  现在改为任何错误都重试，上限 30 次 × 100ms ≈ 3s。initramfs 正常带文件时首次
+  请求即成功，零成本；就算哪天 initramfs 忘了放文件，也只会阻塞 3s 而不是永久失败。
+- **wlan**：`XAGA_NVRAM_MAX_RETRIES` 480 → 120（见方向 3）。
+
+**仍未解决、需要真机验证的**：
+
+- 问题 B 的首次上电失败（3 秒后重试成功）依旧存在——它无害（deferred work 自动恢复），
+  真正的悬案是"不插 USB 永不进桌面"。注意 §8 开头的症状日志采集于问题 A 修复**之前**，
+  当时还有 "Get conf fail" 刷屏；A 修复 + 0002 落地后，请用新镜像重测不插 USB 的启动，
+  并用下面 pstore 的判据确认记录不是旧内核的。
 
 ### 一个容易误判的点
 
