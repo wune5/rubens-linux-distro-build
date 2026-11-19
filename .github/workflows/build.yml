@@ -423,7 +423,7 @@ jobs:
           key: >-
             kernel-${{ env.CACHE_VERSION }}-${{
               inputs.force_kernel_rebuild == true && 'nocache' ||
-              format('{0}-{1}', steps.src.outputs.commit, hashFiles('configs/kernel.config', 'configs/mt6895-fixups.config', 'patches/0001-rubens-port-fixes.patch'))
+              format('{0}-{1}', steps.src.outputs.commit, hashFiles('configs/kernel.config', 'configs/mt6895-fixups.config', 'patches/*.patch'))
             }}
 
       - name: 判断是否真的要编内核
@@ -464,7 +464,16 @@ jobs:
           git config --global --add safe.directory "$PWD"
           git config --global user.name ci
           git config --global user.email ci@localhost
-          git am --3way ../patches/0001-rubens-port-fixes.patch
+          # 应用 patches/ 下所有补丁（按文件名排序，0001/0002/... 依次生效）。
+          # 改内核源码不需要 fork：新增一个 0002-xxx.patch 即可。
+          shopt -s nullglob
+          PATCHES=(../patches/*.patch)
+          shopt -u nullglob
+          [ ${#PATCHES[@]} -gt 0 ] || { echo "::error::patches/ 下没有任何 .patch 文件"; exit 1; }
+          for p in "${PATCHES[@]}"; do
+            echo ">>> 应用 $(basename "$p")"
+            git am --3way "$p"
+          done
           # 工作区必须干净：否则 setlocalversion 会给内核版本追加 '+'，
           # 导致 uname -r 变成 7.2.0+ 而 /lib/modules/7.2.0 里的模块全部失配
           git status --porcelain
@@ -1345,7 +1354,7 @@ jobs:
           path: kernel-cache
           key: >-
             kernel-${{ env.CACHE_VERSION }}-${{
-              format('{0}-{1}', steps.src.outputs.commit, hashFiles('configs/kernel.config', 'configs/mt6895-fixups.config', 'patches/0001-rubens-port-fixes.patch'))
+              format('{0}-{1}', steps.src.outputs.commit, hashFiles('configs/kernel.config', 'configs/mt6895-fixups.config', 'patches/*.patch'))
             }}
 
 
