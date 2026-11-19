@@ -115,6 +115,14 @@ jobs:
       - name: 安装编译工具链
         run: |
           set -euxo pipefail
+          # archive.ubuntu.com / security.ubuntu.com 会持续性抽风（run 44521063597
+          # 连续两次连不上导致全量 Unable to locate package）。GitHub 托管 runner
+          # 跑在 Azure 上，换成 Canonical 官方的 azure.archive.ubuntu.com（同源、
+          # 就近 CDN、archive+security 全覆盖）。deb822 与旧式 sources 都处理。
+          sed -i \
+            -e 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+            -e 's|http://security.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list 2>/dev/null || true
           apt-get update
           apt-get install -y --no-install-recommends sudo \
             clang lld llvm \
