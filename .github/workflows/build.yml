@@ -974,6 +974,14 @@ jobs:
           # distro_finalize：收尾清理（改自上游 common.sh，全部加兜底）。
           distro_finalize() {
           	local root="$1"
+          	# 8b 校验器对 systemd 镜像强制要求这些 unit 已 enable
+          	# （enabled() 查 /etc/systemd/system/*.wants/<unit> 符号链接）。
+          	# apt 安装的 service 理论上会被 deb-systemd-helper 自动 enable，
+          	# 这里显式补齐作为防御（幂等，缺 unit 文件也不失败）。
+          	for unit in NetworkManager.service bluetooth.service \
+          	            ModemManager.service ssh.service mt6895-firstboot.service; do
+          		systemctl --root="$root" enable "$unit" >/dev/null 2>&1 || true
+          	done
           	# 首次启动扩展根文件系统；单元可能不在 overlay 里，容忍缺失。
           	systemctl --root="$root" enable mt6895-firstboot.service >/dev/null 2>&1 || true
           	systemctl --root="$root" mask systemd-firstboot.service >/dev/null 2>&1 || true
@@ -1274,6 +1282,7 @@ jobs:
             --device        rubens-ubuntu \
             --distro        ubuntu \
             --suite         resolute \
+            --ui            console \
             --kernel-repo   "$PWD/../kernel" \
             --kernel-config "$PWD/../$KERNEL_DIR/.config" \
             --firmware      "$PWD/../firmware" \
