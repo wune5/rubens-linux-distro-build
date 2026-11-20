@@ -133,9 +133,16 @@ jobs:
             git rsync patch curl wget ca-certificates file \
             mmdebstrap \
             kmod e2fsprogs util-linux \
+            systemd \
             android-sdk-libsparse-utils \
             mkbootimg \
             qemu-user qemu-user-binfmt binfmt-support arch-test
+          # systemd 是给 build.sh 的宿主工具检查用的（ubuntu 后端
+          # DISTRO_HOST_TOOLS 含 systemctl）。容器里不需要它作为 PID1 运行，
+          # 只要有 /usr/bin/systemctl 这个二进制可执行就行。
+          # run 44532154318（run 6）死在 rootfs 阶段的
+          #   error: missing host tool: systemctl
+          # —— 容器镜像没有 systemd，而旧预检清单没查它，直到内核编完才暴雷。
 
       # 在 x86-64 runner 上构建 arm64 rootfs，必须让内核能执行 arm64 二进制：
       # qemu-user-binfmt 会为 qemu-aarch64 注册 binfmt_misc handler。
@@ -270,16 +277,21 @@ jobs:
           mkbootimg --help >/dev/null 2>&1 && echo "  mkbootimg 可正常执行"
           [ "$fail" = 0 ] || exit 1
 
-      # 预检 build.sh 要求的**全部**宿主工具。
+      # 预检 rootfs 构建所需的**全部**宿主工具。
       #
       # 这条单独成步是有代价换来的：run 8 在 rootfs 阶段死在
       #   error: missing host tool: depmod
       # 而那时内核已经编了 77 分钟。容器是精简的 ubuntu:26.04，
       # 这些工具不会"顺便"带上，必须显式安装 + 显式检查。
       #
-      # 清单与 rootfs/build.sh 里那一行保持一致：
-      #   for tool in mmdebstrap mkfs.ext4 zstd du findmnt depmod
-      # 另加 build.sh 实际会调用、但不在该循环里的 img2simg / llvm-strip。
+      # build.sh（17a922a 重构后）检查的清单是：
+      #   mkfs.ext4 zstd du findmnt depmod git + 后端的 $DISTRO_HOST_TOOLS
+      # ubuntu 后端（本 workflow 现场生成）声明：
+      #   DISTRO_HOST_TOOLS="mmdebstrap chroot unshare systemctl curl"
+      # 合起来就是下面的清单。另加 build.sh 实际会调用、但不在此循环里的
+      # img2simg / llvm-strip。
+      # run 44532154318（run 6）证明这条必须完整：systemctl 缺失，内核编完
+      # 才在 rootfs 阶段暴雷。
       - name: 预检 rootfs 构建所需的宿主工具
         run: |
           set -euxo pipefail
@@ -292,13 +304,18 @@ jobs:
               fail=1
             fi
           }
-          echo "build.sh 的 requires 列表："
-          check mmdebstrap  mmdebstrap
+          echo "build.sh 的 requires 列表（含 ubuntu 后端 DISTRO_HOST_TOOLS）："
           check mkfs.ext4   e2fsprogs
           check zstd        zstd
           check du          coreutils
           check findmnt     util-linux
           check depmod      kmod
+          check git         git
+          check mmdebstrap  mmdebstrap
+          check chroot      coreutils
+          check unshare     util-linux
+          check systemctl   systemd
+          check curl        curl
           echo "build.sh 会调用但不在 requires 列表里的："
           check img2simg    android-sdk-libsparse-utils
           check llvm-strip  llvm
