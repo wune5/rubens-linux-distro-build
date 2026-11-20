@@ -979,12 +979,22 @@ jobs:
           	# apt 安装的 service 理论上会被 deb-systemd-helper 自动 enable，
           	# 这里显式补齐作为防御（幂等，缺 unit 文件也不失败）。
           	for unit in NetworkManager.service bluetooth.service \
-          	            ModemManager.service ssh.service mt6895-firstboot.service; do
-          		systemctl --root="$root" enable "$unit" >/dev/null 2>&1 || true
+          	            ModemManager.service ssh.service; do
+          		systemctl --root="$root" enable "$unit" 2>&1 || \
+          			echo "warning: systemctl --root enable $unit 失败（靠 deb-systemd-helper）" >&2
           	done
-          	# 首次启动扩展根文件系统；单元可能不在 overlay 里，容忍缺失。
-          	systemctl --root="$root" enable mt6895-firstboot.service >/dev/null 2>&1 || true
-          	systemctl --root="$root" mask systemd-firstboot.service >/dev/null 2>&1 || true
+          	# mt6895-firstboot.service 不经 systemctl：run #9 实测宿主
+          	# `systemctl --root enable` 静默失败、chroot 里的 systemctl 没有
+          	# PID1 同样失败，双路都被 || true 吞掉。校验器 enabled() 查的就是
+          	# wants 目录下的符号链接，直接 ln 建立它（相对目标，chroot 内同样可读）。
+          	if [ ! -f "$root/etc/systemd/system/mt6895-firstboot.service" ]; then
+          		echo "::error::rootfs 缺少 /etc/systemd/system/mt6895-firstboot.service（overlay 未生效？）" >&2
+          		return 1
+          	fi
+          	install -d "$root/etc/systemd/system/sysinit.target.wants"
+          	ln -sfn ../mt6895-firstboot.service \
+          		"$root/etc/systemd/system/sysinit.target.wants/mt6895-firstboot.service"
+          	systemctl --root="$root" mask systemd-firstboot.service 2>&1 || true
           	# systemd 镜像不得残留 OpenRC 版 firstboot 脚本（overlay common 自带
           	# etc/init.d/mt6895-firstboot，8b 校验会拒绝；上游 distro_finalize 同删）。
           	rm -f "$root/etc/init.d/mt6895-firstboot"
