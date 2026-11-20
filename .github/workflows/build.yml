@@ -977,6 +977,9 @@ jobs:
           	# 首次启动扩展根文件系统；单元可能不在 overlay 里，容忍缺失。
           	systemctl --root="$root" enable mt6895-firstboot.service >/dev/null 2>&1 || true
           	systemctl --root="$root" mask systemd-firstboot.service >/dev/null 2>&1 || true
+          	# systemd 镜像不得残留 OpenRC 版 firstboot 脚本（overlay common 自带
+          	# etc/init.d/mt6895-firstboot，8b 校验会拒绝；上游 distro_finalize 同删）。
+          	rm -f "$root/etc/init.d/mt6895-firstboot"
           	rm -f "$root/etc/resolv.conf" "$root"/etc/ssh/ssh_host_* \
           	      "$root/var/lib/dbus/machine-id" 2>/dev/null || true
           	ln -s /run/NetworkManager/resolv.conf "$root/etc/resolv.conf"
@@ -1100,6 +1103,22 @@ jobs:
           			passwd -d $user
           		" || echo "warning: could not create user $user" >&2
           	fi
+
+          	# ---------------------------------------------------------- ssh 契约
+          	# 上游 common.sh distro_create_user 写的两个契约文件，8b
+          	# validate-rootfs.py 强制要求 10-mt6895.conf 存在且含
+          	# PermitRootLogin no / PasswordAuthentication no（镜像出厂基线）。
+          	# 本机是开发机，用户已确认放开远程访问：再加一个 00- 前缀
+          	# drop-in，sshd 对多数选项"先读到的值生效"，00- 排在 10- 之前，
+          	# 校验文件原样保留、实际策略以 00- 为准——root+密码直连不变。
+          	install -d -m 0750 "$rootfs/etc/sudoers.d"
+          	printf '%%sudo ALL=(ALL:ALL) ALL\n' > "$rootfs/etc/sudoers.d/10-mt6895"
+          	chmod 0440 "$rootfs/etc/sudoers.d/10-mt6895"
+          	install -d "$rootfs/etc/ssh/sshd_config.d"
+          	printf 'PermitRootLogin no\nPasswordAuthentication no\n' > \
+          		"$rootfs/etc/ssh/sshd_config.d/10-mt6895.conf"
+          	printf 'PermitRootLogin yes\nPasswordAuthentication yes\n' > \
+          		"$rootfs/etc/ssh/sshd_config.d/00-sshd-remote-access.conf"
 
           	# ---------------------------------------------------------- services
           	for unit in systemd-networkd systemd-resolved ssh NetworkManager \
